@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Cooldown: a release must be this many days old before it is proposed.
+  # Green patch and minor bumps merge unattended, so the delay is the window in
+  # which a compromised or broken release gets yanked before it lands here.
+  # Security updates are not delayed.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # GitHub Actions supports default-days only, not the semver-* settings.
+    cooldown:
+      default-days: 7

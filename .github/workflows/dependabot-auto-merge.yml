@@ -1,0 +1,17 @@
+name: Dependabot auto-merge
+'on': pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    # Shared implementation. Native `gh pr merge --auto` waits only for checks
+    # the base branch marks as required, and with none it merges on the spot,
+    # so the reusable uses it only where required checks exist. Otherwise it
+    # polls this PR's own checks and merges once they are green. Majors stay
+    # open for review.
+    # weirdapps/shared-workflows dependabot-auto-merge.yml @main as of 2026-08-17
+    # yamllint disable-line rule:line-length
+    uses: weirdapps/shared-workflows/.github/workflows/dependabot-auto-merge.yml@d6d3dd962e803eaeb56330fff30db2757a996990

@@ -1,0 +1,45 @@
+name: Secret Scan
+
+# Full-history gitleaks scan, delegated to the shared reusable.
+#
+# A server-side scan is the net that does not depend on any contributor's setup,
+# and it applies this repo's own .gitleaks.toml rules, which GitHub's secret
+# scanning does not know. Pre-commit hooks do not close that gap: they never run
+# for a commit pushed by Actions, made on a machine where the hook was never
+# installed, or made with --no-verify.
+#
+# Scans the full history of the checked-out ref on every trigger, not just the
+# push range. See weirdapps/shared-workflows/.github/workflows/gitleaks.yml for
+# why that needs the pinned binary rather than gitleaks-action.
+#
+# Land this gate only on a history that scans clean: a gate that is red on day
+# one teaches the reader to ignore a red gate, which is the habit this exists to
+# break.
+
+"on":
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # 04:17 UTC Mondays. A repo that was clean at merge time does not stay clean:
+    # the rule set moves, and a value that was inert can be re-issued.
+    - cron: "17 4 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # A full-history scan per push adds no signal over a burst of pushes.
+  group: gitleaks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    # weirdapps/shared-workflows gitleaks.yml @main as of 2026-09-17.
+    # PINNED, not @main, deliberately: shared-workflows is PUBLIC, so an
+    # unpinned ref means anything that can push there silently changes what
+    # every repo that calls it scans with. That is a supply-chain hole in the
+    # one control meant to catch supply-chain problems. Dependabot bumps this.
+    # yamllint disable-line rule:line-length
+    uses: weirdapps/shared-workflows/.github/workflows/gitleaks.yml@bc40a10151c193eddd62f6fcd42d1670c1c1a3e1

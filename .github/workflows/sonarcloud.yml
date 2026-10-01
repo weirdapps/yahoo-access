@@ -1,0 +1,141 @@
+name: SonarCloud Analysis
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# Minimal token scope. Without a permissions: key, GITHUB_TOKEN arrives with
+# the repository default, which can be write across contents, issues,
+# pull-requests and more.
+# pull-requests: write is kept on purpose: the SonarCloud action uses
+# GITHUB_TOKEN to decorate the pull request, and that is the one write
+# this job legitimately performs. contents stays read.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  sonarcloud:
+    name: SonarCloud
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0  # Full history for SonarCloud blame
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: '3.13'
+
+      # From uv.lock (hash-pinned), not a fresh resolve from PyPI: this job
+      # later holds SONAR_TOKEN, so as little as possible of what it installs
+      # should be chosen at run time. pytest-cov is not in the lock: it is
+      # pinned by version, but its dependency coverage still resolves from PyPI
+      # at run time, unpinned and without hashes. Adding pytest-cov to the dev
+      # extra and relocking would close that.
+      - name: Install dependencies (uv.lock, frozen)
+        continue-on-error: true
+        run: |
+          python -m pip install uv==0.12.21
+          uv sync --extra dev --frozen
+          uv pip install pytest-cov==7.1.0
+
+      - name: Check for tests
+        id: check-tests
+        run: |
+          if [ -d tests ]; then
+            echo "has_tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_tests=false" >> $GITHUB_OUTPUT
+            echo "::notice::No tests directory found — SonarCloud will scan without coverage"
+          fi
+
+      - name: Run tests with coverage
+        if: steps.check-tests.outputs.has_tests == 'true'
+        continue-on-error: true
+        # --cov must name code that exists. This said `--cov=src` and there is
+        # no src/ here: the code is the single module server.py, which is all
+        # sonar.sources lists. pytest-cov measured nothing, wrote no coverage.xml,
+        # and the `|| true` swallowed it, so SonarCloud logged "No report was
+        # found" while the job stayed green.
+        # `|| true` stays so a failing test, which ci.yml already reports, does
+        # not also block the scan; the next step fails the job when the report
+        # itself is missing or measured nothing.
+        run: .venv/bin/pytest --cov=server --cov-report=xml --cov-report=term-missing || true
+
+      - name: Fail if coverage measured nothing
+        if: steps.check-tests.outputs.has_tests == 'true'
+        run: |
+          if [ ! -s coverage.xml ] || grep -q 'lines-valid="0"' coverage.xml; then
+            echo "::error::coverage.xml is missing or measured nothing: --cov must name code that exists"
+            exit 1
+          fi
+
+      - name: Check for SonarCloud token
+        id: check-sonar
+        # Through env:, so the secret is never expanded into the script text.
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -n "$SONAR_TOKEN" ]; then
+            echo "has_token=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_token=false" >> $GITHUB_OUTPUT
+            echo "::notice::SONAR_TOKEN not configured — skipping SonarCloud scan"
+          fi
+
+      - name: SonarCloud Scan
+        if: steps.check-sonar.outputs.has_token == 'true'
+        # The scanner itself, pinned by commit. The deprecated
+        # sonarcloud-github-action v5 only wrapped this same release, which it
+        # pulled by its moving tag.
+        uses: SonarSource/sonarqube-scan-action@0303d6b62e310685c0e34d0b9cde218036885c4d  # v5.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Fail if the server-side analysis failed
+        # The scanner exits 0 the moment the report finishes uploading. Anything
+        # that rejects the analysis afterwards happens in SonarCloud's Compute
+        # Engine, which the scan step never looks at, so without this step the
+        # job goes green while nothing was measured, and an org-wide quota (such
+        # as a plan's line ceiling) can fail every analysis at once without a
+        # single red build anywhere.
+        if: steps.check-sonar.outputs.has_token == 'true'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -euo pipefail
+          report=.scannerwork/report-task.txt
+          if [ ! -f "$report" ]; then
+            echo "::error::$report is missing, so the analysis cannot be confirmed"
+            exit 1
+          fi
+          task_url=$(sed -n 's/^ceTaskUrl=//p' "$report")
+          get() { python3 -c "import json,sys;print(json.load(sys.stdin)['task']$1)"; }
+          for _ in $(seq 1 60); do
+            body=$(curl -sS -u "${SONAR_TOKEN}:" "$task_url" || true)
+            status=$(printf '%s' "$body" | get "['status']" 2>/dev/null || echo RETRY)
+            case "$status" in
+              SUCCESS)
+                echo "Analysis completed server-side."
+                exit 0
+                ;;
+              FAILED|CANCELED)
+                msg=$(printf '%s' "$body" | get ".get('errorMessage','no message')")
+                echo "::error::SonarCloud analysis $status: $msg"
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+          echo "::error::Timed out after 5 minutes waiting for the SonarCloud analysis task"
+          exit 1
